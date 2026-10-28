@@ -5,14 +5,22 @@ from urllib.parse import urlsplit
 
 class RobotsChecker:
 
-    def __init__(self, user_agent="EducationalCrawler/1.0"):
+    def __init__(self, user_agent="EducationalCrawler/1.0", on_warning=None):
         self.user_agent = user_agent
+        self.on_warning = on_warning
         self.parsers = {}
 
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": self.user_agent
         })
+
+    def _warn(self, message):
+
+        if self.on_warning is not None:
+            self.on_warning(message)
+        else:
+            print(message)
 
     def is_allowed(self, url):
 
@@ -35,9 +43,8 @@ class RobotsChecker:
                 )
 
                 if response.status_code != 200:
-                    print(
-                        "Cannot verify robots.txt:",
-                        response.status_code
+                    self._warn(
+                        f"Cannot verify robots.txt (HTTP {response.status_code})"
                     )
                     return False
 
@@ -46,7 +53,7 @@ class RobotsChecker:
                 ).lower()
 
                 if "text/plain" not in content_type:
-                    print("Invalid robots.txt content type")
+                    self._warn("Invalid robots.txt content type")
                     return False
 
                 parser = Protego.parse(response.text)
@@ -54,7 +61,7 @@ class RobotsChecker:
                 self.parsers[base_url] = parser
 
             except requests.exceptions.RequestException as error:
-                print("Robots error:", error)
+                self._warn(f"Robots error: {error}")
                 return False
 
             finally:

@@ -7,6 +7,7 @@ from fetcher import Fetcher
 from parser import Parser
 from storage import Storage
 from robots_checker import RobotsChecker
+from ui import CrawlerUI
 
 
 class Crawler:
@@ -20,15 +21,18 @@ class Crawler:
     ):
 
         self.start_url = start_url
+        self.allowed_domain = allowed_domain
         self.max_pages = max_pages
         self.delay = delay
+
+        self.ui = CrawlerUI(max_pages)
 
         self.queue = URLQueue()
         self.checker = URLChecker(allowed_domain)
         self.fetcher = Fetcher()
         self.parser = Parser()
         self.storage = Storage()
-        self.robots_checker = RobotsChecker()
+        self.robots_checker = RobotsChecker(on_warning=self.ui.warn)
 
         self.downloaded_pages = 0
         self.discovered_urls = 0
@@ -36,7 +40,14 @@ class Crawler:
         self.redirects = 0
         self.skipped_robots = 0
 
+        self.request_count = 0
+        self.total_request_time = 0.0
+
         self.last_request_time = None
+        self.crawl_started_at = None
+
+        self.stop_status = None
+        self.stop_reason = None
 
     def wait_before_request(self):
 
@@ -47,22 +58,70 @@ class Crawler:
             remaining = self.delay - elapsed
 
             if remaining > 0:
+                self.ui.waiting(remaining)
                 time.sleep(remaining)
+
+    def stop(self, status, reason):
+
+        self.stop_status = status
+        self.stop_reason = reason
+
+    def get_stats(self):
+
+        elapsed = time.perf_counter() - self.crawl_started_at
+
+        avg_response = None
+
+        if self.request_count:
+            avg_response = self.total_request_time / self.request_count
+
+        pages_per_min = None
+
+        if self.downloaded_pages and elapsed > 0:
+            pages_per_min = self.downloaded_pages / elapsed * 60
+
+        return {
+            "downloaded": self.downloaded_pages,
+            "queue": self.queue.size(),
+            "discovered": self.discovered_urls,
+            "errors": self.errors,
+            "redirects": self.redirects,
+            "robots": self.skipped_robots,
+            "total_bytes": self.storage.get_total_size(),
+            "avg_response": avg_response,
+            "pages_per_min": pages_per_min
+        }
+
+    def refresh_ui(self):
+
+        self.ui.update_stats(**self.get_stats())
 
     def crawl(self):
 
-        start_time = time.perf_counter()
+        self.crawl_started_at = time.perf_counter()
+
+        self.ui.header(
+            self.start_url,
+            self.allowed_domain,
+            self.max_pages,
+            self.delay,
+            self.storage.output_dir.resolve()
+        )
+
+        self.ui.start()
 
         try:
+
+            self.ui.set_status("Checking", "start URL and robots.txt")
 
             first_url = self.checker.check(self.start_url)
 
             if first_url is None:
-                print("Start URL is not valid.")
+                self.stop("error", "Start URL is not valid")
                 return
 
             if not self.robots_checker.is_allowed(first_url):
-                print("Start URL is disallowed by robots.txt.")
+                self.stop("error", "Start URL is disallowed by robots.txt")
                 return
 
             self.queue.enqueue(first_url)
@@ -78,23 +137,21 @@ class Crawler:
 
                     self.skipped_robots += 1
 
-                    print("Skipped by robots.txt:", current_url)
+                    self.ui.blocked(current_url)
+                    self.refresh_ui()
 
                     continue
 
                 self.wait_before_request()
 
-                print(f"\nFetching: {current_url}")
+                self.ui.fetching(current_url)
 
                 self.last_request_time = time.monotonic()
 
                 result = self.fetcher.fetch(current_url)
 
-                print(
-                    "Request time:",
-                    round(result.get("elapsed_time", 0), 3),
-                    "seconds"
-                )
+                self.request_count += 1
+                self.total_request_time += result.get("elapsed_time", 0)
 
                 if result.get("redirect"):
 
@@ -121,19 +178,26 @@ class Crawler:
 
                                 self.queue.enqueue(checked_url)
 
-                                print(
-                                    "Redirect queued:",
-                                    checked_url
-                                )
+                                outcome = "queued"
 
                             else:
 
                                 self.skipped_robots += 1
 
-                                print(
-                                    "Redirect blocked by robots.txt:",
-                                    checked_url
-                                )
+                                outcome = "blocked by robots.txt"
+
+                        else:
+
+                            outcome = "ignored (seen / external)"
+
+                        self.ui.redirect(
+                            current_url,
+                            redirect_url,
+                            result.get("status_code"),
+                            outcome
+                        )
+
+                    self.refresh_ui()
 
                     continue
 
@@ -141,13 +205,20 @@ class Crawler:
 
                     self.errors += 1
 
-                    print("Error:", result.get("error", "Unknown fetch error"))
+                    self.ui.failed(
+                        current_url,
+                        result.get("error", "Unknown fetch error"),
+                        result.get("status_code")
+                    )
+
+                    self.refresh_ui()
 
                     if result.get("status_code") in (429, 503):
 
-                        print(
-                            "Server requested reduced traffic. "
-                            "Stopping crawler."
+                        self.stop(
+                            "warn",
+                            f"Server requested reduced traffic "
+                            f"(HTTP {result.get('status_code')}) - crawler stopped"
                         )
 
                         break
@@ -161,15 +232,15 @@ class Crawler:
 
                 self.downloaded_pages += 1
 
-                print(
-                    "Downloaded pages:",
-                    self.downloaded_pages
+                self.ui.saved(
+                    metadata["id"],
+                    result["url"],
+                    metadata["size_bytes"],
+                    result.get("elapsed_time", 0),
+                    result.get("status_code")
                 )
 
-                print(
-                    "Saved file:",
-                    metadata["file"]
-                )
+                self.ui.advance()
 
                 links = self.parser.extract_links(
                     result["html"],
@@ -186,57 +257,42 @@ class Crawler:
 
                         self.queue.enqueue(checked_url)
 
-                print(
-                    "Queue size:",
-                    self.queue.size()
-                )
+                self.refresh_ui()
+
+            if self.stop_reason is None:
+
+                if self.downloaded_pages >= self.max_pages:
+
+                    self.stop(
+                        "ok",
+                        f"Reached the page limit ({self.max_pages} pages)"
+                    )
+
+                else:
+
+                    self.stop(
+                        "ok",
+                        "Queue is empty - nothing left to crawl"
+                    )
+
+        except KeyboardInterrupt:
+
+            self.stop("warn", "Interrupted by user (Ctrl+C)")
 
         finally:
 
             self.fetcher.close()
             self.robots_checker.close()
 
-            elapsed_time = time.perf_counter() - start_time
+            if self.stop_reason is None:
+                self.stop("error", "Stopped by an unexpected error")
 
-            print("\n========== CRAWL REPORT ==========")
+            self.ui.stop()
 
-            print("Downloaded pages:", self.downloaded_pages)
-
-            print(
-                "Discovered URLs (with duplicates):",
-                self.discovered_urls
-            )
-
-            print(
-                "Remaining queue size:",
-                self.queue.size()
-            )
-
-            print("Errors:", self.errors)
-
-            print("Redirects:", self.redirects)
-
-            print(
-                "Skipped by robots.txt:",
-                self.skipped_robots
-            )
-
-            print(
-                "Crawl time:",
-                round(elapsed_time, 2),
-                "seconds"
-            )
-
-            print(
-                "Saved HTML files:",
-                self.storage.saved_pages
-            )
-
-            print(
-                "Total HTML size:",
-                round(
-                    self.storage.get_total_size() / 1024,
-                    2
-                ),
-                "KB"
+            self.ui.report(
+                self.get_stats(),
+                self.stop_status,
+                self.stop_reason,
+                time.perf_counter() - self.crawl_started_at,
+                self.storage.output_dir.resolve()
             )

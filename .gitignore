@@ -40,3 +40,6 @@ robots.txt
 .DS_Store
 Thumbs.db
 desktop.ini
+
+#Requirements
+requirements.txt
